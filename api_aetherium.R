@@ -1,8 +1,8 @@
 # ==========================================
-# api_aetherium.R
-# Backend API para Análisis de Portafolios
+# api_aetherium.R 
+# Backend API - Aetherium (Versión Tiingo Pro)
 # ==========================================
-install.packages(c("dplyr", "tidyr"))
+
 suppressPackageStartupMessages({
   library(plumber)
   library(quantmod)
@@ -11,12 +11,11 @@ suppressPackageStartupMessages({
   library(tidyr)
 })
 
+# Configuraciones globales
 options(quantmod.auto.assign = FALSE)
+MY_TIINGO_TOKEN <- "aed55865812fe78363417505694d04c003812df8"
 
-# ------------------------------------------
-# 1. FUNCIONES CORE Y MANEJO DE DATOS
-# ------------------------------------------
-
+# Función para limpiar y procesar los tickers ingresados
 parse_tickers <- function(x) {
   if (is.null(x) || !nzchar(x)) return(character(0))
   v <- unlist(strsplit(x, ","))
@@ -24,32 +23,44 @@ parse_tickers <- function(x) {
   unique(v[nzchar(v)])
 }
 
+# Función para descargar precios usando la API de Tiingo (Más estable que Yahoo)
 safe_get_prices <- function(ticker, from, to) {
   tryCatch({
-    x <- suppressWarnings(getSymbols(ticker, src = "yahoo", from = from, to = to, auto.assign = FALSE, warnings = FALSE))
+    # Intentamos descargar de Tiingo con tu Token
+    x <- suppressWarnings(
+      getSymbols(ticker, 
+                 src = "tiingo", 
+                 api.key = MY_TIINGO_TOKEN, 
+                 from = from, 
+                 to = to, 
+                 auto.assign = FALSE)
+    )
+    
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    
+    # Extraemos el precio ajustado (Ad)
     adj <- Ad(x)
     adj <- na.omit(adj)
     colnames(adj) <- ticker
     return(adj)
-  }, error = function(e) NULL)
+  }, error = function(e) {
+    return(NULL)
+  })
 }
 
+# Helper para calcular retornos
 to_returns <- function(P) {
   R <- Return.calculate(P, method = "discrete")
   R <- na.omit(R[-1, , drop = FALSE])
   return(R)
 }
 
-# Función clave: Convierte series xts a dataframes planos para la web (JSON)
-xts_to_df <- function(xts_obj, col_name = "value") {
+# Helper para convertir xts a formato JSON amigable para la web
+xts_to_df <- function(xts_obj) {
   df <- data.frame(date = as.character(index(xts_obj)), coredata(xts_obj))
   rownames(df) <- NULL
   return(df)
 }
-
-# ------------------------------------------
-# 2. DEFINICIÓN DE LA API (PLUMBER)
-# ------------------------------------------
 
 #* @filter cors
 cors_setup <- function(res) {
@@ -62,46 +73,38 @@ cors_setup <- function(res) {
 #* @options /api/portafolio
 function() { list(status = "OK") }
 
-#* Analiza el portafolio y devuelve métricas y datos para gráficos
-#* @param tickers:character Tickers separados por coma (ej: "AAPL,MSFT")
-#* @param pesos:character Pesos separados por coma (ej: "0.6,0.4")
-#* @param benchmark:character Ticker del benchmark (ej: "^GSPC")
-#* @param rf:numeric Tasa libre de riesgo (ej: 0.04)
 #* @post /api/portafolio
 function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "^GSPC", rf = 0.04) {
   
-  # Usar tryCatch maestro para que la API nunca se caiga y devuelva errores limpios
   tryCatch({
-    
-    # 1. Parsear inputs
     tk_list <- parse_tickers(tickers)
     w_list <- as.numeric(unlist(strsplit(pesos, ",")))
     rf_rate <- as.numeric(rf)
     
     if(length(tk_list) != length(w_list)) {
-      return(list(error = "La cantidad de tickers y pesos no coincide."))
+      return(list(error = "La cantidad de activos y pesos no coincide."))
     }
     
-    # Normalizar pesos (asegurar que sumen 1)
+    # Normalizar pesos para que sumen 1
     w_list <- w_list / sum(w_list)
     names(w_list) <- tk_list
     
-    # Fechas: Últimos 3 años por defecto para tener buena data estadística
+    # Rango de fechas: últimos 3 años
     to_date <- Sys.Date()
     from_date <- to_date - (365 * 3)
     
-    # 2. Descargar Datos
+    # Descarga de datos
     plist <- lapply(tk_list, safe_get_prices, from = from_date, to = to_date)
-    P <- do.call(merge, c(plist[!vapply(plist, is.null, logical(1))], all = FALSE))
+    plist_valid <- plist[!vapply(plist, is.null, logical(1))]
     
-    if(is.null(P) || ncol(P) < length(tk_list)) {
-      return(list(error = "No se pudieron descargar todos los activos de Yahoo Finance."))
+    if(length(plist_valid) < length(tk_list)) {
+      return(list(error = "Tiingo no pudo encontrar algunos activos. Revisa los tickers."))
     }
     
-    # Descargar Benchmark
+    # Unión de precios y cálculo de retornos
+    P <- do.call(merge, c(plist_valid, all = FALSE))
     P_bench <- safe_get_prices(benchmark, from = from_date, to = to_date)
     
-    # 3. Cálculos de Retornos
     R <- to_returns(P)
     port_R <- Return.portfolio(R, weights = w_list, rebalance_on = "months")
     colnames(port_R) <- "Portafolio"
@@ -109,42 +112,35 @@ function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "^GSPC", rf = 0.0
     bench_R <- if(!is.null(P_bench)) to_returns(P_bench) else NULL
     if(!is.null(bench_R)) colnames(bench_R) <- "Benchmark"
     
-    # 4. Métricas Estadísticas (CAGR, Vol, Sharpe, MaxDD)
+    # Métricas Financieras (PerformanceAnalytics)
     port_cagr <- Return.annualized(port_R, scale = 252)
     port_vol <- StdDev.annualized(port_R, scale = 252)
     port_sharpe <- SharpeRatio.annualized(port_R, Rf = rf_rate/252, scale = 252)
     port_maxdd <- maxDrawdown(port_R)
     
-    # 5. Preparar datos para gráficos (Growth of $1)
+    # Datos para el gráfico (Índice de riqueza base 1)
     wealth_index <- cumprod(1 + port_R)
     chart_data <- xts_to_df(wealth_index)
     
     if(!is.null(bench_R)) {
       bench_wealth <- cumprod(1 + bench_R)
-      # Alinear fechas
+      # Unimos portafolio y benchmark para el gráfico
       M_wealth <- na.omit(merge(wealth_index, bench_wealth))
       chart_data <- xts_to_df(M_wealth)
     }
     
-    # 6. Construir la respuesta JSON perfecta
     return(list(
       status = "success",
-      inputs = list(
-        activos = tk_list,
-        pesos_normalizados = w_list
-      ),
       metricas = list(
         cagr = as.numeric(port_cagr),
         volatilidad = as.numeric(port_vol),
         sharpe = as.numeric(port_sharpe),
         max_drawdown = as.numeric(port_maxdd)
       ),
-      graficos = list(
-        crecimiento_historico = chart_data
-      )
+      graficos = list(crecimiento_historico = chart_data)
     ))
     
   }, error = function(e) {
-    return(list(error = paste("Error interno en el cálculo:", e$message)))
+    return(list(error = paste("Error en el motor financiero:", e$message)))
   })
 }
