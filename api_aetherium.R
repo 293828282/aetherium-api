@@ -1,6 +1,6 @@
 # ==========================================
 # api_aetherium.R 
-# Backend API - Aetherium (Versión Tiingo Pro)
+# Versión FINAL BLINDADA - Aetherium
 # ==========================================
 
 suppressPackageStartupMessages({
@@ -11,59 +11,13 @@ suppressPackageStartupMessages({
   library(tidyr)
 })
 
-# Configuraciones globales
+# Configuraciones y Token
 options(quantmod.auto.assign = FALSE)
 MY_TIINGO_TOKEN <- "aed55865812fe78363417505694d04c003812df8"
 
-# Función para limpiar y procesar los tickers ingresados
-parse_tickers <- function(x) {
-  if (is.null(x) || !nzchar(x)) return(character(0))
-  v <- unlist(strsplit(x, ","))
-  v <- toupper(trimws(v))
-  unique(v[nzchar(v)])
-}
-
-# Función para descargar precios usando la API de Tiingo (Más estable que Yahoo)
-safe_get_prices <- function(ticker, from, to) {
-  tryCatch({
-    # Intentamos descargar de Tiingo con tu Token
-    x <- suppressWarnings(
-      getSymbols(ticker, 
-                 src = "tiingo", 
-                 api.key = MY_TIINGO_TOKEN, 
-                 from = from, 
-                 to = to, 
-                 auto.assign = FALSE)
-    )
-    
-    if (is.null(x) || nrow(x) == 0) return(NULL)
-    
-    # Extraemos el precio ajustado (Ad)
-    adj <- Ad(x)
-    adj <- na.omit(adj)
-    colnames(adj) <- ticker
-    return(adj)
-  }, error = function(e) {
-    return(NULL)
-  })
-}
-
-# Helper para calcular retornos
-to_returns <- function(P) {
-  R <- Return.calculate(P, method = "discrete")
-  R <- na.omit(R[-1, , drop = FALSE])
-  return(R)
-}
-
-# Helper para convertir xts a formato JSON amigable para la web
-xts_to_df <- function(xts_obj) {
-  df <- data.frame(date = as.character(index(xts_obj)), coredata(xts_obj))
-  rownames(df) <- NULL
-  return(df)
-}
-
+# 1. FILTRO DE SEGURIDAD (CORS) - ESTO ES LO QUE ESTABA BLOQUEANDO A CODEPEN
 #* @filter cors
-cors_setup <- function(req, res) {
+function(req, res) {
   res$setHeader("Access-Control-Allow-Origin", "*")
   res$setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
   res$setHeader("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
@@ -76,26 +30,45 @@ cors_setup <- function(req, res) {
   plumber::forward()
 }
 
-#* @options /api/portafolio
-function() { list(status = "OK") }
+# 2. FUNCIONES DE APOYO
+parse_tickers <- function(x) {
+  if (is.null(x) || !nzchar(x)) return(character(0))
+  v <- unlist(strsplit(x, ","))
+  v <- toupper(trimws(v))
+  unique(v[nzchar(v)])
+}
 
+safe_get_prices <- function(ticker, from, to) {
+  tryCatch({
+    # Limpiar ticker (Tiingo no usa el ^ de Yahoo)
+    clean_ticker <- gsub("\\^", "", ticker)
+    if(clean_ticker == "GSPC") clean_ticker <- "SPY" # Autocorrección de benchmark
+    
+    x <- getSymbols(clean_ticker, src = "tiingo", api.key = MY_TIINGO_TOKEN, 
+                    from = from, to = to, auto.assign = FALSE)
+    
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    adj <- Ad(x)
+    adj <- na.omit(adj)
+    colnames(adj) <- ticker
+    return(adj)
+  }, error = function(e) return(NULL))
+}
+
+# 3. EL CORAZÓN DE LA API
 #* @post /api/portafolio
-function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "^GSPC", rf = 0.04) {
+function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "SPY", rf = 0.04) {
   
   tryCatch({
     tk_list <- parse_tickers(tickers)
     w_list <- as.numeric(unlist(strsplit(pesos, ",")))
-    rf_rate <- as.numeric(rf)
     
     if(length(tk_list) != length(w_list)) {
       return(list(error = "La cantidad de activos y pesos no coincide."))
     }
     
-    # Normalizar pesos para que sumen 1
     w_list <- w_list / sum(w_list)
-    names(w_list) <- tk_list
     
-    # Rango de fechas: últimos 3 años
     to_date <- Sys.Date()
     from_date <- to_date - (365 * 3)
     
@@ -104,35 +77,37 @@ function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "^GSPC", rf = 0.0
     plist_valid <- plist[!vapply(plist, is.null, logical(1))]
     
     if(length(plist_valid) < length(tk_list)) {
-      return(list(error = "Tiingo no pudo encontrar algunos activos. Revisa los tickers."))
+      return(list(error = "No se pudieron obtener datos de todos los activos. Revisa los nombres."))
     }
     
-    # Unión de precios y cálculo de retornos
     P <- do.call(merge, c(plist_valid, all = FALSE))
     P_bench <- safe_get_prices(benchmark, from = from_date, to = to_date)
     
-    R <- to_returns(P)
-    port_R <- Return.portfolio(R, weights = w_list, rebalance_on = "months")
+    # Retornos
+    R <- na.omit(Return.calculate(P, method = "discrete"))
+    port_R <- Return.portfolio(R, weights = w_list)
     colnames(port_R) <- "Portafolio"
     
-    bench_R <- if(!is.null(P_bench)) to_returns(P_bench) else NULL
-    if(!is.null(bench_R)) colnames(bench_R) <- "Benchmark"
+    bench_R <- if(!is.null(P_bench)) na.omit(Return.calculate(P_bench, method = "discrete")) else NULL
     
-    # Métricas Financieras (PerformanceAnalytics)
+    # Métricas
     port_cagr <- Return.annualized(port_R, scale = 252)
     port_vol <- StdDev.annualized(port_R, scale = 252)
-    port_sharpe <- SharpeRatio.annualized(port_R, Rf = rf_rate/252, scale = 252)
-    port_maxdd <- maxDrawdown(port_R)
+    port_sharpe <- SharpeRatio.annualized(port_R, Rf = as.numeric(rf)/252, scale = 252)
+    port_mdd <- maxDrawdown(port_R)
     
-    # Datos para el gráfico (Índice de riqueza base 1)
-    wealth_index <- cumprod(1 + port_R)
-    chart_data <- xts_to_df(wealth_index)
+    # Datos para gráfico
+    wealth <- cumprod(1 + port_R)
+    df_chart <- data.frame(date = as.character(index(wealth)), Portafolio = as.numeric(wealth))
     
     if(!is.null(bench_R)) {
       bench_wealth <- cumprod(1 + bench_R)
-      # Unimos portafolio y benchmark para el gráfico
-      M_wealth <- na.omit(merge(wealth_index, bench_wealth))
-      chart_data <- xts_to_df(M_wealth)
+      m_wealth <- merge(wealth, bench_wealth, all = FALSE)
+      df_chart <- data.frame(
+        date = as.character(index(m_wealth)),
+        Portafolio = as.numeric(m_wealth[,1]),
+        Benchmark = as.numeric(m_wealth[,2])
+      )
     }
     
     return(list(
@@ -141,12 +116,12 @@ function(tickers = "AAPL,MSFT", pesos = "0.5,0.5", benchmark = "^GSPC", rf = 0.0
         cagr = as.numeric(port_cagr),
         volatilidad = as.numeric(port_vol),
         sharpe = as.numeric(port_sharpe),
-        max_drawdown = as.numeric(port_maxdd)
+        max_drawdown = as.numeric(port_mdd)
       ),
-      graficos = list(crecimiento_historico = chart_data)
+      graficos = list(crecimiento_historico = df_chart)
     ))
     
   }, error = function(e) {
-    return(list(error = paste("Error en el motor financiero:", e$message)))
+    return(list(error = paste("Error interno:", e$message)))
   })
 }
