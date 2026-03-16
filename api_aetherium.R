@@ -63,10 +63,16 @@ xts_to_df <- function(xts_obj) {
 }
 
 #* @filter cors
-cors_setup <- function(res) {
+cors_setup <- function(req, res) {
   res$setHeader("Access-Control-Allow-Origin", "*")
-  res$setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-  res$setHeader("Access-Control-Allow-Headers", "Content-Type")
+  res$setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+  res$setHeader("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
+  
+  if (req$REQUEST_METHOD == "OPTIONS") {
+    res$status <- 200
+    return(res)
+  }
+  
   plumber::forward()
 }
 
